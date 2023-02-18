@@ -28,7 +28,7 @@ class Cursor:
     #:
     #: Max size of allowed statement is max_allowed_packet - packet_header_size.
     #: Default value of max_allowed_packet is 1048576.
-    max_stmt_length = 1024000
+    max_stmt_length = 1024
 
     def __init__(self, connection):
         self.connection = connection
@@ -159,6 +159,48 @@ class Cursor:
         self._executed = query
         return result
 
+    def _preprocess_executemany(self, query):
+        m = RE_INSERT_VALUES.match(query)
+        if m:
+            q_prefix = m.group(1) % ()
+            q_values = m.group(2).rstrip()
+            q_postfix = m.group(3) or ""
+            assert q_values[0] == "(" and q_values[-1] == ")"
+            return q_prefix, q_values, q_postfix
+        return None, None, None
+
+    def mogrify_many(self, query, args):
+        """
+        Returns a list of the exact string that would be sent to the database by
+        calling the executemany() method.
+
+        :param query: Query to mogrify.
+        :type query: str
+
+        :param args: Parameters used with query. (optional)
+        :type args: tuple, list or dict
+
+        :return: List of the querys with argument binding applied.
+        :rtype: list
+        """
+        if not args:
+            return
+
+        q_prefix, q_values, q_postfix = self._preprocess_executemany(query)
+
+        if q_prefix and q_values:
+            return self._do_execute_many(
+                q_prefix,
+                q_values,
+                q_postfix,
+                args,
+                self.max_stmt_length,
+                self._get_db().encoding,
+                dry=True,
+            )
+
+        return [self.mogrify(query, arg) for arg in args]
+
     def executemany(self, query, args):
         """Run several data against one query.
 
@@ -178,12 +220,9 @@ class Cursor:
         if not args:
             return
 
-        m = RE_INSERT_VALUES.match(query)
-        if m:
-            q_prefix = m.group(1) % ()
-            q_values = m.group(2).rstrip()
-            q_postfix = m.group(3) or ""
-            assert q_values[0] == "(" and q_values[-1] == ")"
+        q_prefix, q_values, q_postfix = self._preprocess_executemany(query)
+
+        if q_prefix and q_values:
             return self._do_execute_many(
                 q_prefix,
                 q_values,
@@ -193,12 +232,13 @@ class Cursor:
                 self._get_db().encoding,
             )
 
-        self.rowcount = sum(self.execute(query, arg) for arg in args)
+        self.rowcount = sum(self.execute(q) for q in self.mogrify_many(query, args))
         return self.rowcount
 
     def _do_execute_many(
-        self, prefix, values, postfix, args, max_stmt_length, encoding
+        self, prefix, values, postfix, args, max_stmt_length, encoding, dry=False
     ):
+        sqls = []
         conn = self._get_db()
         escape = self._escape_args
         if isinstance(prefix, str):
@@ -217,14 +257,21 @@ class Cursor:
             if isinstance(v, str):
                 v = v.encode(encoding, "surrogateescape")
             if len(sql) + len(v) + len(postfix) + 1 > max_stmt_length:
-                rows += self.execute(sql + postfix)
+                if dry:
+                    sqls.append((sql + postfix).decode(encoding) + ";")
+                else:
+                    rows += self.execute(sql + postfix)
                 sql = bytearray(prefix)
             else:
                 sql += b","
             sql += v
-        rows += self.execute(sql + postfix)
-        self.rowcount = rows
-        return rows
+        if dry:
+            sqls.append((sql + postfix).decode(encoding) + ";")
+            return sqls
+        else:
+            rows += self.execute(sql + postfix)
+            self.rowcount = rows
+            return rows
 
     def callproc(self, procname, args=()):
         """Execute stored procedure procname with args.
